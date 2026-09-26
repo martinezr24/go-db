@@ -41,12 +41,28 @@ func AsBitmap(data []byte, numBits int) Bitmap {
 // SetBit sets the bit at index i to the given value.
 // Returns the previous value of the bit.
 func (b *Bitmap) SetBit(i int, on bool) (originalValue bool) {
-	panic("unimplemented")
+	wordIndex := i / 64
+	offset := uint(i % 64)
+	mask := uint64(1) << offset
+
+	oldVal := b.words[wordIndex]&mask != 0
+
+	if on {
+		b.words[wordIndex] = b.words[wordIndex] | mask
+	} else {
+		b.words[wordIndex] = b.words[wordIndex] &^ mask
+	}
+
+	return oldVal
 }
 
 // LoadBit returns the value of the bit at index i.
 func (b *Bitmap) LoadBit(i int) bool {
-	panic("unimplemented")
+	wordIndex := i / 64
+	offset := uint(i % 64)
+	mask := uint64(1) << offset
+
+	return b.words[wordIndex]&mask != 0
 }
 
 // FindFirstZero searches for the first bit set to 0 (false) in the bitmap.
@@ -56,5 +72,17 @@ func (b *Bitmap) LoadBit(i int) bool {
 //
 // Returns the index of the first zero bit found, or -1 if the bitmap is entirely full.
 func (b *Bitmap) FindFirstZero(startHint int) int {
-	panic("unimplemented")
+	for i := startHint; i < b.numBits; i++ {
+		if !b.LoadBit(i) {
+			return i
+		}
+	}
+
+	for i := 0; i < startHint; i++ {
+		if !b.LoadBit(i) {
+			return i
+		}
+	}
+
+	return -1
 }
