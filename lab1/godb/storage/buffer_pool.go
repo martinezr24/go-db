@@ -1,6 +1,8 @@
 package storage
 
 import (
+	"sync"
+
 	"mit.edu/dsg/godb/common"
 )
 
@@ -13,19 +15,42 @@ import (
 // BufferPool instance).
 type BufferPool struct {
 	// add more fields here...
+	frames         []PageFrame
+	numPages       int
+	storageManager DBFileManager
+	logManager     LogManager
+	pageTable      map[common.PageID]*PageFrame
+	mutex          sync.Mutex
+	loading        map[common.PageID]chan struct{}
+	available      *sync.Cond
+	recentlyUsed   map[*PageFrame]bool
+	framePos       int
 }
+
+// need to store page frames, which page is in each frame, whether its pinned, and whether its dirty
 
 // NewBufferPool creates a new BufferPool with a fixed capacity defined by numPages. It requires a
 // storageManager to handle the underlying disk I/O operations.
 //
 // Hint: You will need to worry about logManager until Lab 3
 func NewBufferPool(numPages int, storageManager DBFileManager, logManager LogManager) *BufferPool {
-	panic("unimplemented")
+
+	bp := &BufferPool{
+		frames:         make([]PageFrame, numPages),
+		numPages:       numPages,
+		storageManager: storageManager,
+		logManager:     logManager,
+		pageTable:      make(map[common.PageID]*PageFrame),
+		loading:        make(map[common.PageID]chan struct{}),
+		recentlyUsed:   make(map[*PageFrame]bool),
+	}
+	bp.available = sync.NewCond(&bp.mutex)
+	return bp
 }
 
 // StorageManager returns the underlying disk manager.
 func (bp *BufferPool) StorageManager() DBFileManager {
-	panic("unimplemented")
+	return bp.storageManager
 }
 
 // GetPage retrieves a page from the buffer pool, ensuring it is pinned (i.e. prevented from eviction until
@@ -33,20 +58,218 @@ func (bp *BufferPool) StorageManager() DBFileManager {
 // present, the method must first make space by selecting a victim frame to evict
 // (potentially writing it to disk if dirty), and then read the requested page from disk into that frame.
 func (bp *BufferPool) GetPage(pageID common.PageID) (*PageFrame, error) {
-	panic("unimplemented")
+	bp.mutex.Lock()
+	frame, found := bp.pageTable[pageID]
+	if found {
+		frame.pinCount++
+		bp.recentlyUsed[frame] = true
+		bp.mutex.Unlock()
+		return frame, nil
+	}
+
+	if done, isLoading := bp.loading[pageID]; isLoading {
+		bp.mutex.Unlock()
+		<-done
+		return bp.GetPage(pageID)
+	}
+
+	var freeFrame *PageFrame
+	for i := range bp.frames {
+		curFrame := &bp.frames[i]
+		if curFrame.pageID.IsNil() {
+			freeFrame = curFrame
+			break
+		}
+	}
+	if freeFrame != nil {
+		freeFrame.pinCount = 1
+		freeFrame.pageID = pageID
+
+		done := make(chan struct{})
+		bp.loading[pageID] = done
+
+		bp.mutex.Unlock()
+
+		file, err := bp.storageManager.GetDBFile(pageID.Oid)
+		if err == nil {
+			err = file.ReadPage(int(pageID.PageNum), freeFrame.Bytes[:])
+		}
+		if err != nil {
+			bp.mutex.Lock()
+			freeFrame.pageID = common.PageID{}
+			freeFrame.pinCount = 0
+			delete(bp.loading, pageID)
+			close(done)
+			bp.mutex.Unlock()
+			return nil, err
+		}
+
+		bp.mutex.Lock()
+		bp.recentlyUsed[freeFrame] = false
+		bp.pageTable[pageID] = freeFrame
+		delete(bp.loading, pageID)
+		close(done)
+		bp.mutex.Unlock()
+
+		return freeFrame, nil
+
+	} else {
+		var evictFrame *PageFrame
+		var fallback *PageFrame
+
+		searchLimit := bp.numPages
+		if searchLimit > 64 {
+			searchLimit = 64
+		}
+
+		for checked := 0; checked < searchLimit; checked++ {
+			ind := bp.framePos
+			bp.framePos = (ind + 1) % bp.numPages
+
+			cur := &bp.frames[ind]
+			if cur.pinCount > 0 {
+				continue
+			}
+
+			if fallback == nil {
+				fallback = cur
+			}
+
+			if !bp.recentlyUsed[cur] {
+				evictFrame = cur
+				break
+			}
+
+			bp.recentlyUsed[cur] = false
+		}
+		if evictFrame == nil {
+			evictFrame = fallback
+		}
+		if evictFrame == nil {
+			bp.available.Wait()
+			bp.mutex.Unlock()
+			return bp.GetPage(pageID)
+		}
+		oldPageID := evictFrame.pageID
+		wasDirty := evictFrame.dirty
+		evictFrame.pinCount = 1
+		delete(bp.pageTable, oldPageID)
+
+		oldDone := make(chan struct{})
+		bp.loading[oldPageID] = oldDone
+		done := make(chan struct{})
+		bp.loading[pageID] = done
+
+		bp.mutex.Unlock()
+
+		var err error
+		if wasDirty {
+			oldFile, fileErr := bp.storageManager.GetDBFile(oldPageID.Oid)
+			if fileErr != nil {
+				err = fileErr
+			} else {
+				err = oldFile.WritePage(int(oldPageID.PageNum), evictFrame.Bytes[:])
+			}
+		}
+		if err != nil {
+			bp.mutex.Lock()
+			evictFrame.pinCount = 0
+			bp.pageTable[oldPageID] = evictFrame
+			delete(bp.loading, oldPageID)
+			close(oldDone)
+			delete(bp.loading, pageID)
+			close(done)
+			bp.mutex.Unlock()
+			return nil, err
+		}
+
+		newFile, err := bp.storageManager.GetDBFile(pageID.Oid)
+		if err == nil {
+			err = newFile.ReadPage(int(pageID.PageNum), evictFrame.Bytes[:])
+		}
+		if err != nil {
+			bp.mutex.Lock()
+			evictFrame.pageID = common.PageID{}
+			evictFrame.pinCount = 0
+			evictFrame.dirty = false
+			delete(bp.loading, oldPageID)
+			close(oldDone)
+			delete(bp.loading, pageID)
+			close(done)
+			bp.mutex.Unlock()
+			return nil, err
+		}
+
+		bp.mutex.Lock()
+		evictFrame.pageID = pageID
+		evictFrame.dirty = false
+		bp.recentlyUsed[evictFrame] = false
+		bp.pageTable[pageID] = evictFrame
+		delete(bp.loading, oldPageID)
+		close(oldDone)
+		delete(bp.loading, pageID)
+		close(done)
+		bp.mutex.Unlock()
+		return evictFrame, nil
+	}
 }
 
 // UnpinPage indicates that the caller is done using a page. It unpins the page, making the page potentially evictable
 // if no other thread is accessing it. If the setDirty flag is true, the page is marked as modified, ensuring
 // it will be written back to disk before eviction.
 func (bp *BufferPool) UnpinPage(frame *PageFrame, setDirty bool) {
-	panic("unimplemented")
+	bp.mutex.Lock()
+
+	frame.pinCount--
+	if setDirty {
+		frame.dirty = true
+	}
+	if frame.pinCount == 0 {
+		bp.available.Signal()
+	}
+
+	bp.mutex.Unlock()
 }
 
 // FlushAllPages flushes all dirty pages to disk that have an LSN less than `flushedUntil`, regardless of pins.
 // This is typically called during a checkpoint or Shutdown to ensure durability, but also useful for tests
 func (bp *BufferPool) FlushAllPages() error {
-	panic("unimplemented")
+	for i := range bp.frames {
+		bp.mutex.Lock()
+		frame := &bp.frames[i]
+
+		if !frame.dirty || frame.pageID.IsNil() {
+			bp.mutex.Unlock()
+			continue
+		}
+
+		pageID := frame.pageID
+		frame.pinCount++
+		bp.mutex.Unlock()
+
+		frame.PageLatch.RLock()
+		file, err := bp.storageManager.GetDBFile(pageID.Oid)
+		if err == nil {
+			err = file.WritePage(int(pageID.PageNum), frame.Bytes[:])
+		}
+
+		if err == nil {
+			bp.mutex.Lock()
+			frame.dirty = false
+			frame.pinCount--
+			bp.mutex.Unlock()
+			frame.PageLatch.RUnlock()
+			continue
+		}
+
+		frame.PageLatch.RUnlock()
+		bp.mutex.Lock()
+		frame.pinCount--
+		bp.mutex.Unlock()
+		return err
+	}
+
+	return nil
 }
 
 // GetDirtyPageTableSnapshot returns a map of all currently dirty pages and their RecoveryLSN.

@@ -20,6 +20,9 @@ type PageFrame struct {
 	// PageLatch protects the content of the page from concurrent access.
 	PageLatch sync.RWMutex
 	// Hint: You will need to add fields and synchronization structures here to track the state of this page.
+	dirty    bool
+	pinCount int
+	pageID   common.PageID
 }
 
 // Detect system endianness -- compiler should statically replace this with a constant
