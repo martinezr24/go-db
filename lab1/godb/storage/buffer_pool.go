@@ -16,6 +16,7 @@ import (
 type BufferPool struct {
 	// add more fields here...
 	frames         []PageFrame
+	freeFrames     []int
 	numPages       int
 	storageManager DBFileManager
 	logManager     LogManager
@@ -35,8 +36,14 @@ type BufferPool struct {
 // Hint: You will need to worry about logManager until Lab 3
 func NewBufferPool(numPages int, storageManager DBFileManager, logManager LogManager) *BufferPool {
 
+	freeFrames := make([]int, numPages)
+	for i := range freeFrames {
+		freeFrames[i] = i
+	}
+
 	bp := &BufferPool{
 		frames:         make([]PageFrame, numPages),
+		freeFrames:     freeFrames,
 		numPages:       numPages,
 		storageManager: storageManager,
 		logManager:     logManager,
@@ -74,15 +81,11 @@ func (bp *BufferPool) GetPage(pageID common.PageID) (*PageFrame, error) {
 			continue
 		}
 
-		var freeFrame *PageFrame
-		for i := range bp.frames {
-			curFrame := &bp.frames[i]
-			if curFrame.pageID.IsNil() {
-				freeFrame = curFrame
-				break
-			}
-		}
-		if freeFrame != nil {
+		if len(bp.freeFrames) > 0 {
+			lastFree := len(bp.freeFrames) - 1
+			freeFrameIndex := bp.freeFrames[lastFree]
+			bp.freeFrames = bp.freeFrames[:lastFree]
+			freeFrame := &bp.frames[freeFrameIndex]
 			freeFrame.pinCount = 1
 			freeFrame.pageID = pageID
 
@@ -98,8 +101,10 @@ func (bp *BufferPool) GetPage(pageID common.PageID) (*PageFrame, error) {
 				bp.mutex.Lock()
 				freeFrame.pageID = common.PageID{}
 				freeFrame.pinCount = 0
+				bp.freeFrames = append(bp.freeFrames, freeFrameIndex)
 				delete(bp.loading, pageID)
 				close(done)
+				bp.available.Signal()
 				bp.mutex.Unlock()
 				return nil, err
 			}
@@ -116,6 +121,8 @@ func (bp *BufferPool) GetPage(pageID common.PageID) (*PageFrame, error) {
 
 		var evictFrame *PageFrame
 		var fallback *PageFrame
+		var evictFrameIndex int
+		var fallbackIndex int
 
 		searchLimit := bp.numPages
 		if searchLimit > 64 {
@@ -133,10 +140,12 @@ func (bp *BufferPool) GetPage(pageID common.PageID) (*PageFrame, error) {
 
 			if fallback == nil {
 				fallback = cur
+				fallbackIndex = ind
 			}
 
 			if !bp.recentlyUsed[cur] {
 				evictFrame = cur
+				evictFrameIndex = ind
 				break
 			}
 
@@ -144,6 +153,7 @@ func (bp *BufferPool) GetPage(pageID common.PageID) (*PageFrame, error) {
 		}
 		if evictFrame == nil {
 			evictFrame = fallback
+			evictFrameIndex = fallbackIndex
 		}
 		if evictFrame == nil {
 			bp.available.Wait()
@@ -192,10 +202,12 @@ func (bp *BufferPool) GetPage(pageID common.PageID) (*PageFrame, error) {
 			evictFrame.pageID = common.PageID{}
 			evictFrame.pinCount = 0
 			evictFrame.dirty = false
+			bp.freeFrames = append(bp.freeFrames, evictFrameIndex)
 			delete(bp.loading, oldPageID)
 			close(oldDone)
 			delete(bp.loading, pageID)
 			close(done)
+			bp.available.Signal()
 			bp.mutex.Unlock()
 			return nil, err
 		}
