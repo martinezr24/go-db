@@ -147,6 +147,7 @@ func (bp *BufferPool) GetPage(pageID common.PageID) (*PageFrame, error) {
 		}
 		if evictFrame == nil {
 			bp.available.Wait()
+			bp.mutex.Unlock()
 			continue
 		}
 		oldPageID := evictFrame.pageID
