@@ -58,62 +58,62 @@ func (bp *BufferPool) StorageManager() DBFileManager {
 // present, the method must first make space by selecting a victim frame to evict
 // (potentially writing it to disk if dirty), and then read the requested page from disk into that frame.
 func (bp *BufferPool) GetPage(pageID common.PageID) (*PageFrame, error) {
-	bp.mutex.Lock()
-	frame, found := bp.pageTable[pageID]
-	if found {
-		frame.pinCount++
-		bp.recentlyUsed[frame] = true
-		bp.mutex.Unlock()
-		return frame, nil
-	}
-
-	if done, isLoading := bp.loading[pageID]; isLoading {
-		bp.mutex.Unlock()
-		<-done
-		return bp.GetPage(pageID)
-	}
-
-	var freeFrame *PageFrame
-	for i := range bp.frames {
-		curFrame := &bp.frames[i]
-		if curFrame.pageID.IsNil() {
-			freeFrame = curFrame
-			break
+	for {
+		bp.mutex.Lock()
+		frame, found := bp.pageTable[pageID]
+		if found {
+			frame.pinCount++
+			bp.recentlyUsed[frame] = true
+			bp.mutex.Unlock()
+			return frame, nil
 		}
-	}
-	if freeFrame != nil {
-		freeFrame.pinCount = 1
-		freeFrame.pageID = pageID
 
-		done := make(chan struct{})
-		bp.loading[pageID] = done
-
-		bp.mutex.Unlock()
-
-		file, err := bp.storageManager.GetDBFile(pageID.Oid)
-		if err == nil {
-			err = file.ReadPage(int(pageID.PageNum), freeFrame.Bytes[:])
+		if done, isLoading := bp.loading[pageID]; isLoading {
+			bp.mutex.Unlock()
+			<-done
+			continue
 		}
-		if err != nil {
+
+		var freeFrame *PageFrame
+		for i := range bp.frames {
+			curFrame := &bp.frames[i]
+			if curFrame.pageID.IsNil() {
+				freeFrame = curFrame
+				break
+			}
+		}
+		if freeFrame != nil {
+			freeFrame.pinCount = 1
+			freeFrame.pageID = pageID
+
+			done := make(chan struct{})
+			bp.loading[pageID] = done
+			bp.mutex.Unlock()
+
+			file, err := bp.storageManager.GetDBFile(pageID.Oid)
+			if err == nil {
+				err = file.ReadPage(int(pageID.PageNum), freeFrame.Bytes[:])
+			}
+			if err != nil {
+				bp.mutex.Lock()
+				freeFrame.pageID = common.PageID{}
+				freeFrame.pinCount = 0
+				delete(bp.loading, pageID)
+				close(done)
+				bp.mutex.Unlock()
+				return nil, err
+			}
+
 			bp.mutex.Lock()
-			freeFrame.pageID = common.PageID{}
-			freeFrame.pinCount = 0
+			bp.recentlyUsed[freeFrame] = false
+			bp.pageTable[pageID] = freeFrame
 			delete(bp.loading, pageID)
 			close(done)
 			bp.mutex.Unlock()
-			return nil, err
+
+			return freeFrame, nil
 		}
 
-		bp.mutex.Lock()
-		bp.recentlyUsed[freeFrame] = false
-		bp.pageTable[pageID] = freeFrame
-		delete(bp.loading, pageID)
-		close(done)
-		bp.mutex.Unlock()
-
-		return freeFrame, nil
-
-	} else {
 		var evictFrame *PageFrame
 		var fallback *PageFrame
 
@@ -147,8 +147,7 @@ func (bp *BufferPool) GetPage(pageID common.PageID) (*PageFrame, error) {
 		}
 		if evictFrame == nil {
 			bp.available.Wait()
-			bp.mutex.Unlock()
-			return bp.GetPage(pageID)
+			continue
 		}
 		oldPageID := evictFrame.pageID
 		wasDirty := evictFrame.dirty
