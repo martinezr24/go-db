@@ -75,9 +75,16 @@ func (frame *PageFrame) AsHeapPage() HeapPage {
 }
 
 func (hp HeapPage) FindFreeSlot() int {
-	numSlots := hp.NumSlots()
-	bmBytes := ((numSlots + 63) / 64) * 8
+	if hp.PageFrame == nil {
+		return -1
+	}
 
+	numSlots := hp.NumSlots()
+	if numSlots <= 0 {
+		return -1
+	}
+
+	bmBytes := ((numSlots + 63) / 64) * 8
 	allocation := AsBitmap(hp.Bytes[16:16+bmBytes], numSlots)
 
 	return allocation.FindFirstZero(0)
@@ -85,8 +92,15 @@ func (hp HeapPage) FindFreeSlot() int {
 
 // IsAllocated checks the allocation bitmap to see if a slot is valid.
 func (hp HeapPage) IsAllocated(rid common.RecordID) bool {
+	if hp.PageFrame == nil {
+		return false
+	}
+
 	slot := int(rid.Slot)
 	numSlots := hp.NumSlots()
+	if slot < 0 || slot >= numSlots || numSlots <= 0 {
+		return false
+	}
 
 	bmBytes := ((numSlots + 63) / 64) * 8
 	allocation := AsBitmap(hp.Bytes[16:16+bmBytes], numSlots)
@@ -97,8 +111,11 @@ func (hp HeapPage) IsAllocated(rid common.RecordID) bool {
 func (hp HeapPage) MarkAllocated(rid common.RecordID, allocated bool) {
 	slot := int(rid.Slot)
 	numSlots := hp.NumSlots()
-	bmBytes := ((numSlots + 63) / 64) * 8
+	if hp.PageFrame == nil || slot < 0 || slot >= numSlots || numSlots <= 0 {
+		return
+	}
 
+	bmBytes := ((numSlots + 63) / 64) * 8
 	allocation := AsBitmap(hp.Bytes[16:16+bmBytes], numSlots)
 
 	wasAllocated := allocation.SetBit(slot, allocated)
@@ -118,10 +135,17 @@ func (hp HeapPage) MarkAllocated(rid common.RecordID, allocated bool) {
 }
 
 func (hp HeapPage) IsDeleted(rid common.RecordID) bool {
+	if hp.PageFrame == nil {
+		return false
+	}
+
 	slot := int(rid.Slot)
 	numSlots := hp.NumSlots()
-	bmBytes := ((numSlots + 63) / 64) * 8
+	if slot < 0 || slot >= numSlots || numSlots <= 0 {
+		return false
+	}
 
+	bmBytes := ((numSlots + 63) / 64) * 8
 	deletedStart := 16 + bmBytes
 	deletedBM := AsBitmap(hp.Bytes[deletedStart:deletedStart+bmBytes], numSlots)
 
@@ -131,23 +155,34 @@ func (hp HeapPage) IsDeleted(rid common.RecordID) bool {
 func (hp HeapPage) MarkDeleted(rid common.RecordID, deleted bool) {
 	slot := int(rid.Slot)
 	numSlots := hp.NumSlots()
+	if hp.PageFrame == nil || slot < 0 || slot >= numSlots || numSlots <= 0 {
+		return
+	}
+
 	bmBytes := ((numSlots + 63) / 64) * 8
-
 	deletedStart := 16 + bmBytes
-
 	deletedBM := AsBitmap(hp.Bytes[deletedStart:deletedStart+bmBytes], numSlots)
 
 	deletedBM.SetBit(slot, deleted)
 }
 
 func (hp HeapPage) AccessTuple(rid common.RecordID) RawTuple {
+	if hp.PageFrame == nil {
+		return nil
+	}
+
 	slot := int(rid.Slot)
 	numSlots := hp.NumSlots()
+	if slot < 0 || slot >= numSlots || numSlots <= 0 {
+		return nil
+	}
+
 	bmBytes := ((numSlots + 63) / 64) * 8
-
 	rowsStart := 16 + (2 * bmBytes)
-
 	start := rowsStart + slot*hp.RowSize()
+	if start < 0 || start+hp.RowSize() > len(hp.Bytes) {
+		return nil
+	}
 
 	return RawTuple(hp.Bytes[start : start+hp.RowSize()])
 }

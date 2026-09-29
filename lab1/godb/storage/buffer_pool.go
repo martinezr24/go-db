@@ -218,16 +218,20 @@ func (bp *BufferPool) GetPage(pageID common.PageID) (*PageFrame, error) {
 // if no other thread is accessing it. If the setDirty flag is true, the page is marked as modified, ensuring
 // it will be written back to disk before eviction.
 func (bp *BufferPool) UnpinPage(frame *PageFrame, setDirty bool) {
-	bp.mutex.Lock()
+	if frame == nil {
+		return
+	}
 
-	frame.pinCount--
+	bp.mutex.Lock()
+	if frame.pinCount > 0 {
+		frame.pinCount--
+	}
 	if setDirty {
 		frame.dirty = true
 	}
 	if frame.pinCount == 0 {
 		bp.available.Signal()
 	}
-
 	bp.mutex.Unlock()
 }
 

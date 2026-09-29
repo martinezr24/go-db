@@ -23,6 +23,9 @@ type Bitmap struct {
 // 1. data must be aligned to 8 bytes to allow safe casting to uint64.
 // 2. data must be large enough to contain numBits (rounded up to the nearest 8-byte word).
 func AsBitmap(data []byte, numBits int) Bitmap {
+	if numBits <= 0 {
+		return Bitmap{words: nil, numBits: 0}
+	}
 	common.Assert(common.AlignedTo8(len(data)), "Bitmap bytes length must be aligned to 8")
 
 	numWords := (numBits + 63) / 64
@@ -41,6 +44,10 @@ func AsBitmap(data []byte, numBits int) Bitmap {
 // SetBit sets the bit at index i to the given value.
 // Returns the previous value of the bit.
 func (b *Bitmap) SetBit(i int, on bool) (originalValue bool) {
+	if i < 0 || i >= b.numBits || b.words == nil {
+		return false
+	}
+
 	wordIndex := i / 64
 	offset := uint(i % 64)
 	mask := uint64(1) << offset
@@ -58,6 +65,10 @@ func (b *Bitmap) SetBit(i int, on bool) (originalValue bool) {
 
 // LoadBit returns the value of the bit at index i.
 func (b *Bitmap) LoadBit(i int) bool {
+	if i < 0 || i >= b.numBits || b.words == nil {
+		return false
+	}
+
 	wordIndex := i / 64
 	offset := uint(i % 64)
 	mask := uint64(1) << offset
@@ -72,13 +83,24 @@ func (b *Bitmap) LoadBit(i int) bool {
 //
 // Returns the index of the first zero bit found, or -1 if the bitmap is entirely full.
 func (b *Bitmap) FindFirstZero(startHint int) int {
-	for i := startHint; i < b.numBits; i++ {
+	if b == nil || b.numBits <= 0 {
+		return -1
+	}
+
+	start := startHint
+	if start < 0 {
+		start = 0
+	} else if start >= b.numBits {
+		start = start % b.numBits
+	}
+
+	for i := start; i < b.numBits; i++ {
 		if !b.LoadBit(i) {
 			return i
 		}
 	}
 
-	for i := 0; i < startHint; i++ {
+	for i := 0; i < start; i++ {
 		if !b.LoadBit(i) {
 			return i
 		}
