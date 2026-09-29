@@ -15,7 +15,7 @@ import (
 // BufferPool instance).
 type BufferPool struct {
 	// add more fields here...
-	frames         []PageFrame
+	frames         []*PageFrame
 	freeFrames     []int
 	numPages       int
 	storageManager DBFileManager
@@ -42,7 +42,7 @@ func NewBufferPool(numPages int, storageManager DBFileManager, logManager LogMan
 	}
 
 	bp := &BufferPool{
-		frames:         make([]PageFrame, numPages),
+		frames:         make([]*PageFrame, numPages),
 		freeFrames:     freeFrames,
 		numPages:       numPages,
 		storageManager: storageManager,
@@ -85,7 +85,11 @@ func (bp *BufferPool) GetPage(pageID common.PageID) (*PageFrame, error) {
 			lastFree := len(bp.freeFrames) - 1
 			freeFrameIndex := bp.freeFrames[lastFree]
 			bp.freeFrames = bp.freeFrames[:lastFree]
-			freeFrame := &bp.frames[freeFrameIndex]
+			freeFrame := bp.frames[freeFrameIndex]
+			if freeFrame == nil {
+				freeFrame = &PageFrame{}
+				bp.frames[freeFrameIndex] = freeFrame
+			}
 			freeFrame.pinCount = 1
 			freeFrame.pageID = pageID
 
@@ -133,7 +137,7 @@ func (bp *BufferPool) GetPage(pageID common.PageID) (*PageFrame, error) {
 			ind := bp.framePos
 			bp.framePos = (ind + 1) % bp.numPages
 
-			cur := &bp.frames[ind]
+			cur := bp.frames[ind]
 			if cur.pinCount > 0 {
 				continue
 			}
@@ -252,7 +256,11 @@ func (bp *BufferPool) UnpinPage(frame *PageFrame, setDirty bool) {
 func (bp *BufferPool) FlushAllPages() error {
 	for i := range bp.frames {
 		bp.mutex.Lock()
-		frame := &bp.frames[i]
+		frame := bp.frames[i]
+		if frame == nil {
+			bp.mutex.Unlock()
+			continue
+		}
 
 		if !frame.dirty || frame.pageID.IsNil() {
 			bp.mutex.Unlock()
