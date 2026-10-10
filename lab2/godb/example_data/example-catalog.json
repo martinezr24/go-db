@@ -1,0 +1,98 @@
+{
+  "next_id": 10,
+  "tables": [
+    {
+      "oid": 1,
+      "name": "warehouse",
+      "columns": [
+        { "name": "w_id", "type": 1 },
+        { "name": "w_name", "type": 2 },
+        { "name": "w_ytd", "type": 1 }
+      ],
+      "indexes": [
+        {
+          "oid": 2,
+          "table_oid": 1,
+          "name": "idx_w_pk",
+          "type": "btree",
+          "key_schema": ["w_id"]
+        }
+      ]
+    },
+    {
+      "oid": 3,
+      "name": "district",
+      "columns": [
+        { "name": "d_id", "type": 1 },
+        { "name": "d_w_id", "type": 1 },
+        { "name": "d_name", "type": 2 },
+        { "name": "d_ytd", "type": 1 }
+      ],
+      "indexes": [
+        {
+          "oid": 4,
+          "table_oid": 3,
+          "name": "idx_d_pk",
+          "type": "btree",
+          "key_schema": ["d_w_id", "d_id"]
+        }
+      ]
+    },
+    {
+      "oid": 5,
+      "name": "customer",
+      "columns": [
+        { "name": "c_id", "type": 1 },
+        { "name": "c_d_id", "type": 1 },
+        { "name": "c_w_id", "type": 1 },
+        { "name": "c_first", "type": 2 },
+        { "name": "c_last", "type": 2 },
+        { "name": "c_credit", "type": 2 },
+        { "name": "c_balance", "type": 1 }
+      ],
+      "indexes": [
+        {
+          "oid": 6,
+          "table_oid": 5,
+          "name": "idx_c_pk",
+          "type": "btree",
+          "key_schema": ["c_w_id", "c_d_id", "c_id"]
+        },
+        {
+          "oid": 7,
+          "table_oid": 5,
+          "name": "idx_c_last",
+          "type": "btree",
+          "key_schema": ["c_w_id", "c_d_id", "c_last"]
+        }
+      ]
+    },
+    {
+      "oid": 8,
+      "name": "orders",
+      "columns": [
+        { "name": "o_id", "type": 1 },
+        { "name": "o_d_id", "type": 1 },
+        { "name": "o_w_id", "type": 1 },
+        { "name": "o_c_id", "type": 1 },
+        { "name": "o_carrier_id", "type": 1 }
+      ],
+      "indexes": [
+        {
+          "oid": 9,
+          "table_oid": 8,
+          "name": "idx_o_pk",
+          "type": "btree",
+          "key_schema": ["o_w_id", "o_d_id", "o_id"]
+        },
+        {
+          "oid": 10,
+          "table_oid": 8,
+          "name": "idx_o_cust",
+          "type": "btree",
+          "key_schema": ["o_w_id", "o_d_id", "o_c_id"]
+        }
+      ]
+    }
+  ]
+}
