@@ -9,33 +9,73 @@ import (
 // It consumes all tuples from its child during the first execution and stores them.
 // Subsequent calls to Init/Next iterate over the stored tuples.
 type MaterializeExecutor struct {
-	// Fill me in!
+	plan  *planner.MaterializeNode
+	child Executor
+
+	tuples       []storage.Tuple
+	cursor       int
+	materialized bool
+	current      storage.Tuple
+	err          error
 }
 
 func NewMaterializeExecutor(plan *planner.MaterializeNode, child Executor) *MaterializeExecutor {
-	panic("unimplemented")
+	return &MaterializeExecutor{
+		plan:  plan,
+		child: child,
+	}
 }
 
 func (e *MaterializeExecutor) PlanNode() planner.PlanNode {
-	panic("unimplemented")
+	return e.plan
 }
 
 func (e *MaterializeExecutor) Init(ctx *ExecutorContext) error {
-	panic("unimplemented")
+	e.cursor = 0
+	e.current = storage.Tuple{}
+
+	if e.materialized {
+		return e.err
+	}
+
+	e.err = nil
+	if err := e.child.Init(ctx); err != nil {
+		e.err = err
+		return err
+	}
+
+	desc := storage.NewRawTupleDesc(e.plan.Child.OutputSchema())
+	for e.child.Next() {
+		e.tuples = append(e.tuples, e.child.Current().DeepCopy(desc))
+	}
+
+	if err := e.child.Error(); err != nil {
+		e.err = err
+		return err
+	}
+
+	e.materialized = true
+	return nil
 }
 
 func (e *MaterializeExecutor) Next() bool {
-	panic("unimplemented")
+	if e.err != nil || e.cursor >= len(e.tuples) {
+		return false
+	}
+
+	e.current = e.tuples[e.cursor]
+	e.cursor++
+	return true
 }
 
 func (e *MaterializeExecutor) Current() storage.Tuple {
-	panic("unimplemented")
+	return e.current
 }
 
 func (e *MaterializeExecutor) Error() error {
-	panic("unimplemented")
+	return e.err
 }
 
 func (e *MaterializeExecutor) Close() error {
-	panic("unimplemented")
+	return e.child.Close()
 }
