@@ -4,6 +4,7 @@ import (
 	"mit.edu/dsg/godb/indexing"
 	"mit.edu/dsg/godb/planner"
 	"mit.edu/dsg/godb/storage"
+	"mit.edu/dsg/godb/transaction"
 )
 
 // IndexScanExecutor executes a range scan over an index.
@@ -13,6 +14,7 @@ type IndexScanExecutor struct {
 	plan      *planner.IndexScanNode
 	index     indexing.Index
 	tableHeap *TableHeap
+	txn       *transaction.TransactionContext
 	iterator  indexing.ScanIterator
 	buffer    []byte
 	current   storage.Tuple
@@ -37,16 +39,18 @@ func (e *IndexScanExecutor) Init(ctx *ExecutorContext) error {
 			e.err = err
 			return err
 		}
+		e.iterator = nil
 	}
 
 	e.err = nil
 	e.current = storage.Tuple{}
 	e.buffer = make([]byte, e.tableHeap.StorageSchema().BytesPerTuple())
+	e.txn = ctx.GetTransaction()
 
 	iterator, err := e.index.Scan(
 		e.plan.StartKey,
 		e.plan.Direction,
-		ctx.GetTransaction(),
+		e.txn,
 	)
 	if err != nil {
 		e.err = err
@@ -69,7 +73,7 @@ func (e *IndexScanExecutor) Next() bool {
 
 	rid := e.iterator.Value()
 	if err := e.tableHeap.ReadTuple(
-		nil, // Replace with the transaction from Init; see note below.
+		e.txn,
 		rid,
 		e.buffer,
 		e.plan.ForUpdate,
@@ -94,7 +98,11 @@ func (e *IndexScanExecutor) Close() error {
 	if e.iterator == nil {
 		return nil
 	}
-	return e.iterator.Close()
+	if err := e.iterator.Close(); err != nil {
+		return err
+	}
+	e.iterator = nil
+	return nil
 }
 
 func (e *IndexScanExecutor) Error() error {

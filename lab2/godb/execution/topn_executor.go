@@ -23,6 +23,7 @@ type topNHeap struct {
 
 func (h topNHeap) Len() int { return len(h.items) }
 
+// Less puts the worst retained row at the root so it can be replaced quickly.
 func (h topNHeap) Less(i, j int) bool {
 	comparison := compareTopNRows(h.items[i].tuple, h.items[j].tuple, h.orderBy)
 	if comparison == 0 {
@@ -117,11 +118,15 @@ func (e *TopNExecutor) Next() bool {
 		}
 
 		sort.SliceStable(candidates.items, func(i, j int) bool {
-			return compareTopNRows(
+			comparison := compareTopNRows(
 				candidates.items[i].tuple,
 				candidates.items[j].tuple,
 				e.plan.OrderBy,
-			) < 0
+			)
+			if comparison == 0 {
+				return candidates.items[i].ordinal < candidates.items[j].ordinal
+			}
+			return comparison < 0
 		})
 
 		for _, item := range candidates.items {

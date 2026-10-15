@@ -48,6 +48,14 @@ func (e *AggregateExecutor) Init(ctx *ExecutorContext) error {
 	e.built = false
 	e.current = storage.Tuple{}
 	e.err = nil
+
+	for _, clause := range e.plan.AggClauses {
+		if clause.Type == planner.AggSum && clause.Expr.OutputType() != common.IntType {
+			e.err = fmt.Errorf("SUM requires an integer expression")
+			return e.err
+		}
+	}
+
 	return e.child.Init(ctx)
 }
 
@@ -116,16 +124,21 @@ func (e *AggregateExecutor) buildGroups() bool {
 				if value.IsNull() {
 					continue
 				}
-				if value.Type() != common.IntType {
-					e.err = fmt.Errorf("SUM requires an integer expression")
-					return false
-				}
 				if !group.seen[i] {
 					group.values[i] = value
 					group.seen[i] = true
 				} else {
+					sum := group.values[i].IntValue()
+					addend := value.IntValue()
+					const maxInt64 = 1<<63 - 1
+					const minInt64 = -1 << 63
+					if (addend > 0 && sum > maxInt64-addend) ||
+						(addend < 0 && sum < minInt64-addend) {
+						e.err = fmt.Errorf("SUM result overflows int64")
+						return false
+					}
 					group.values[i] = common.NewIntValue(
-						group.values[i].IntValue() + value.IntValue(),
+						sum + addend,
 					)
 				}
 			case planner.AggMin:

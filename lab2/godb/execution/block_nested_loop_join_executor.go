@@ -39,11 +39,15 @@ type BlockNestedLoopJoinExecutor struct {
 // NewBlockNestedLoopJoinExecutor creates a new BlockNestedLoopJoinExecutor.
 func NewBlockNestedLoopJoinExecutor(plan *planner.NestedLoopJoinNode, left Executor, right Executor) *BlockNestedLoopJoinExecutor {
 	leftSchema := storage.NewRawTupleDesc(plan.Left.OutputSchema())
+	leftRowSize := leftSchema.BytesPerTuple()
+	if leftRowSize == 0 {
+		leftRowSize = 1
+	}
 	return &BlockNestedLoopJoinExecutor{
 		plan:        plan,
 		left:        left,
 		right:       right,
-		leftRowSize: leftSchema.BytesPerTuple(),
+		leftRowSize: leftRowSize,
 	}
 }
 
@@ -112,11 +116,13 @@ func (e *BlockNestedLoopJoinExecutor) Next() bool {
 			if e.err != nil {
 				return false
 			}
-			if err := e.right.Init(e.ctx); err != nil {
-				e.err = err
-				return false
+			if !e.rightStarted {
+				if err := e.right.Init(e.ctx); err != nil {
+					e.err = err
+					return false
+				}
+				e.rightStarted = true
 			}
-			e.rightStarted = true
 			e.leftIndex = 0
 		}
 

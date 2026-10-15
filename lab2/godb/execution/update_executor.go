@@ -36,7 +36,6 @@ func NewUpdateExecutor(plan *planner.UpdateNode, child Executor, tableHeap *Tabl
 
 func (e *UpdateExecutor) PlanNode() planner.PlanNode {
 	return e.plan
-
 }
 
 func (e *UpdateExecutor) Init(ctx *ExecutorContext) error {
