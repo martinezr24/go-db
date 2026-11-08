@@ -2,6 +2,7 @@ package execution
 
 import (
 	"errors"
+	"sync"
 
 	"mit.edu/dsg/godb/catalog"
 	"mit.edu/dsg/godb/common"
@@ -18,11 +19,24 @@ type TableHeap struct {
 	bufferPool  *storage.BufferPool
 	logManager  storage.LogManager
 	lockManager *transaction.LockManager
+	insertMutex sync.Mutex
 }
 
 // NewTableHeap creates a TableHeap and performs a metadata scan to initialize stats.
 func NewTableHeap(table *catalog.Table, bufferPool *storage.BufferPool, logManager storage.LogManager, lockManager *transaction.LockManager) (*TableHeap, error) {
-	panic("unimplemented")
+	fieldTypes := make([]common.Type, len(table.Columns))
+	for i, column := range table.Columns {
+		fieldTypes[i] = column.Type
+	}
+
+	th := &TableHeap{
+		oid:         table.Oid,
+		desc:        storage.NewRawTupleDesc(fieldTypes),
+		bufferPool:  bufferPool,
+		logManager:  logManager,
+		lockManager: lockManager,
+	}
+	return th, nil
 }
 
 // StorageSchema returns the physical byte-layout descriptor of the tuples in this table.
@@ -30,75 +44,401 @@ func (tableHeap *TableHeap) StorageSchema() *storage.RawTupleDesc {
 	return tableHeap.desc
 }
 
+func (tableHeap *TableHeap) appendLogRecord(txn *transaction.TransactionContext, frame *storage.PageFrame, record storage.LogRecord) error {
+	if txn == nil {
+		return nil
+	}
+	lsn, err := tableHeap.logManager.Append(record)
+	if err != nil {
+		return err
+	}
+	frame.MonotonicallyUpdateLSN(lsn)
+	return nil
+}
+
 // InsertTuple inserts a tuple into the TableHeap. It should find a free space, allocating if needed, and return the found slot.
 func (tableHeap *TableHeap) InsertTuple(txn *transaction.TransactionContext, row storage.RawTuple) (common.RecordID, error) {
-	panic("unimplemented")
+	if txn != nil {
+		if err := txn.AcquireLock(transaction.NewTableLockTag(tableHeap.oid), transaction.LockModeIX); err != nil {
+			return common.RecordID{}, err
+		}
+	}
+
+	tableHeap.insertMutex.Lock()
+	defer tableHeap.insertMutex.Unlock()
+
+	file, err := tableHeap.bufferPool.StorageManager().GetDBFile(tableHeap.oid)
+	if err != nil {
+		return common.RecordID{}, err
+	}
+
+	numPages, err := file.NumPages()
+	if err != nil {
+		return common.RecordID{}, err
+	}
+
+	var pageID common.PageID
+	var frame *storage.PageFrame
+	var rid common.RecordID
+	newPage := false
+
+	if numPages > 0 {
+		pageID = common.PageID{
+			Oid:     tableHeap.oid,
+			PageNum: int32(numPages - 1),
+		}
+
+		frame, err = tableHeap.bufferPool.GetPage(pageID)
+		if err != nil {
+			return common.RecordID{}, err
+		}
+
+		frame.PageLatch.Lock()
+		hp := frame.AsHeapPage()
+		slot := hp.FindFreeSlot()
+		frame.PageLatch.Unlock()
+		if slot >= 0 {
+			rid = common.RecordID{PageID: pageID, Slot: int32(slot)}
+		} else {
+			tableHeap.bufferPool.UnpinPage(frame, false)
+			frame = nil
+		}
+	}
+
+	if frame == nil {
+		pageNum, err := file.AllocatePage(1)
+		if err != nil {
+			return common.RecordID{}, err
+		}
+
+		pageID = common.PageID{
+			Oid:     tableHeap.oid,
+			PageNum: int32(pageNum),
+		}
+
+		frame, err = tableHeap.bufferPool.GetPage(pageID)
+		if err != nil {
+			return common.RecordID{}, err
+		}
+		frame.PageLatch.Lock()
+		storage.InitializeHeapPage(tableHeap.desc, frame)
+		frame.PageLatch.Unlock()
+		rid = common.RecordID{PageID: pageID, Slot: 0}
+		newPage = true
+	}
+
+	if txn != nil {
+		if err := txn.AcquireLock(transaction.NewTupleLockTag(rid), transaction.LockModeX); err != nil {
+			tableHeap.bufferPool.UnpinPage(frame, false)
+			return common.RecordID{}, err
+		}
+	}
+
+	frame.PageLatch.Lock()
+	hp := frame.AsHeapPage()
+	if !newPage && hp.IsAllocated(rid) {
+		frame.PageLatch.Unlock()
+		tableHeap.bufferPool.UnpinPage(frame, false)
+		return common.RecordID{}, errors.New("selected insert slot is no longer free")
+	}
+
+	if txn != nil {
+		if err := tableHeap.appendLogRecord(txn, frame, txn.NewInsertRecord(rid, row)); err != nil {
+			frame.PageLatch.Unlock()
+			tableHeap.bufferPool.UnpinPage(frame, false)
+			return common.RecordID{}, err
+		}
+	}
+
+	hp.MarkAllocated(rid, true)
+	copy(hp.AccessTuple(rid), row)
+
+	frame.PageLatch.Unlock()
+	tableHeap.bufferPool.UnpinPage(frame, true)
+	return rid, nil
 }
 
 var ErrTupleDeleted = errors.New("tuple has been deleted")
 
 // DeleteTuple marks a tuple as deleted in the TableHeap. If the tuple has been deleted, return ErrTupleDeleted
 func (tableHeap *TableHeap) DeleteTuple(txn *transaction.TransactionContext, rid common.RecordID) error {
-	panic("unimplemented")
+	if txn != nil {
+		if err := txn.AcquireLock(transaction.NewTableLockTag(tableHeap.oid), transaction.LockModeIX); err != nil {
+			return err
+		}
+		if err := txn.AcquireLock(transaction.NewTupleLockTag(rid), transaction.LockModeX); err != nil {
+			return err
+		}
+	}
+
+	frame, err := tableHeap.bufferPool.GetPage(rid.PageID)
+	if err != nil {
+		return err
+	}
+
+	frame.PageLatch.Lock()
+	hp := frame.AsHeapPage()
+
+	if !hp.IsAllocated(rid) || hp.IsDeleted(rid) {
+		frame.PageLatch.Unlock()
+		tableHeap.bufferPool.UnpinPage(frame, false)
+		return ErrTupleDeleted
+	}
+
+	if txn != nil {
+		if err := tableHeap.appendLogRecord(txn, frame, txn.NewDeleteRecord(rid)); err != nil {
+			frame.PageLatch.Unlock()
+			tableHeap.bufferPool.UnpinPage(frame, false)
+			return err
+		}
+	}
+	hp.MarkDeleted(rid, true)
+
+	frame.PageLatch.Unlock()
+	tableHeap.bufferPool.UnpinPage(frame, true)
+	return nil
 }
 
 // ReadTuple reads the physical bytes of a tuple into the provided buffer. If forUpdate is true, read should acquire
 // exclusive lock instead of shared. If the tuple has been deleted, return ErrTupleDeleted
 func (tableHeap *TableHeap) ReadTuple(txn *transaction.TransactionContext, rid common.RecordID, buffer []byte, forUpdate bool) error {
-	panic("unimplemented")
+	if txn != nil {
+		tableMode, tupleMode := transaction.LockModeIS, transaction.LockModeS
+		if forUpdate {
+			tableMode, tupleMode = transaction.LockModeIX, transaction.LockModeX
+		}
+		if err := txn.AcquireLock(transaction.NewTableLockTag(tableHeap.oid), tableMode); err != nil {
+			return err
+		}
+		if err := txn.AcquireLock(transaction.NewTupleLockTag(rid), tupleMode); err != nil {
+			return err
+		}
+	}
+
+	frame, err := tableHeap.bufferPool.GetPage(rid.PageID)
+	if err != nil {
+		return err
+	}
+
+	frame.PageLatch.RLock()
+	hp := frame.AsHeapPage()
+
+	if !hp.IsAllocated(rid) || hp.IsDeleted(rid) {
+		frame.PageLatch.RUnlock()
+		tableHeap.bufferPool.UnpinPage(frame, false)
+		return ErrTupleDeleted
+	}
+
+	copy(buffer, hp.AccessTuple(rid))
+
+	frame.PageLatch.RUnlock()
+	tableHeap.bufferPool.UnpinPage(frame, false)
+	return nil
 }
 
 // UpdateTuple updates a tuple in-place with new binary data. If the tuple has been deleted, return ErrTupleDeleted.
 func (tableHeap *TableHeap) UpdateTuple(txn *transaction.TransactionContext, rid common.RecordID, updatedTuple storage.RawTuple) error {
-	panic("unimplemented")
+	if txn != nil {
+		if err := txn.AcquireLock(transaction.NewTableLockTag(tableHeap.oid), transaction.LockModeIX); err != nil {
+			return err
+		}
+		if err := txn.AcquireLock(transaction.NewTupleLockTag(rid), transaction.LockModeX); err != nil {
+			return err
+		}
+	}
+
+	frame, err := tableHeap.bufferPool.GetPage(rid.PageID)
+	if err != nil {
+		return err
+	}
+
+	frame.PageLatch.Lock()
+	hp := frame.AsHeapPage()
+
+	if !hp.IsAllocated(rid) || hp.IsDeleted(rid) {
+		frame.PageLatch.Unlock()
+		tableHeap.bufferPool.UnpinPage(frame, false)
+		return ErrTupleDeleted
+	}
+
+	if txn != nil {
+		before := append(storage.RawTuple(nil), hp.AccessTuple(rid)...)
+		if err := tableHeap.appendLogRecord(txn, frame, txn.NewUpdateRecord(rid, before, updatedTuple)); err != nil {
+			frame.PageLatch.Unlock()
+			tableHeap.bufferPool.UnpinPage(frame, false)
+			return err
+		}
+	}
+	copy(hp.AccessTuple(rid), updatedTuple)
+
+	frame.PageLatch.Unlock()
+	tableHeap.bufferPool.UnpinPage(frame, true)
+	return nil
 }
 
 // VacuumPage attempts to clean up deleted slots on a specific page.
 // If slots are deleted AND no transaction holds a lock on them, they are marked as free.
 // This is used to reclaim space in the background.
 func (tableHeap *TableHeap) VacuumPage(pageID common.PageID) error {
-	panic("unimplemented")
+	frame, err := tableHeap.bufferPool.GetPage(pageID)
+	if err != nil {
+		return err
+	}
+
+	frame.PageLatch.Lock()
+	hp := frame.AsHeapPage()
+	changed := false
+
+	for slot := 0; slot < hp.NumSlots(); slot++ {
+		rid := common.RecordID{
+			PageID: pageID,
+			Slot:   int32(slot),
+		}
+
+		if hp.IsAllocated(rid) && hp.IsDeleted(rid) &&
+			(tableHeap.lockManager == nil ||
+				!tableHeap.lockManager.LockHeld(transaction.NewTupleLockTag(rid))) {
+			hp.MarkAllocated(rid, false)
+			changed = true
+		}
+	}
+
+	frame.PageLatch.Unlock()
+	tableHeap.bufferPool.UnpinPage(frame, changed)
+	return nil
 }
 
 // Iterator creates a new TableHeapIterator to scan the table. It acquires the supplied lock on the table (S, X, or SIX),
 // and uses the supplied byte slice to fetch tuples in the returned iterator (for zero-allocation scanning).
 func (tableHeap *TableHeap) Iterator(txn *transaction.TransactionContext, mode transaction.DBLockMode, buffer []byte) (TableHeapIterator, error) {
-	panic("unimplemented")
+	if len(buffer) < tableHeap.desc.BytesPerTuple() {
+		return TableHeapIterator{}, errors.New("iterator buffer is too small")
+	}
+	if txn != nil {
+		if err := txn.AcquireLock(transaction.NewTableLockTag(tableHeap.oid), mode); err != nil {
+			return TableHeapIterator{}, err
+		}
+	}
+
+	file, err := tableHeap.bufferPool.StorageManager().GetDBFile(tableHeap.oid)
+	if err != nil {
+		return TableHeapIterator{}, err
+	}
+
+	numPages, err := file.NumPages()
+	if err != nil {
+		return TableHeapIterator{}, err
+	}
+
+	return TableHeapIterator{
+		tableHeap: tableHeap,
+		numPages:  numPages,
+		pageNum:   0,
+		slot:      -1,
+		buffer:    buffer,
+	}, nil
 }
 
 // TableHeapIterator iterates over all valid (allocated and non-deleted) tuples in the heap.
 type TableHeapIterator struct {
-	// Fill me in!
+	tableHeap *TableHeap
+	numPages  int
+	pageNum   int
+	slot      int
+	frame     *storage.PageFrame
+	curRid    common.RecordID
+	curTuple  storage.RawTuple
+	buffer    []byte
+	err       error
+	closed    bool
 }
 
 // IsNil returns true if the TableHeapIterator is the default, uninitialized value
 func (it *TableHeapIterator) IsNil() bool {
-	panic("unimplemented")
+	return it == nil || it.tableHeap == nil
 }
 
 // Next advances the iterator to the next valid tuple.
 // It manages page pins automatically (unpinning the old page when moving to a new one).
 func (it *TableHeapIterator) Next() bool {
-	panic("unimplemented")
+	if it.IsNil() || it.closed {
+		return false
+	}
+
+	it.curTuple = nil
+
+	for it.pageNum < it.numPages {
+		if it.frame == nil {
+			pageID := common.PageID{Oid: it.tableHeap.oid, PageNum: int32(it.pageNum)}
+
+			frame, err := it.tableHeap.bufferPool.GetPage(pageID)
+			if err != nil {
+				it.err = err
+				return false
+			}
+
+			it.frame = frame
+			it.slot = -1
+		}
+
+		it.frame.PageLatch.RLock()
+		hp := it.frame.AsHeapPage()
+
+		for it.slot++; it.slot < hp.NumSlots(); it.slot++ {
+			rid := common.RecordID{PageID: common.PageID{Oid: it.tableHeap.oid, PageNum: int32(it.pageNum)}, Slot: int32(it.slot)}
+
+			if hp.IsAllocated(rid) && !hp.IsDeleted(rid) {
+				rowSize := it.tableHeap.desc.BytesPerTuple()
+				copy(it.buffer[:rowSize], hp.AccessTuple(rid))
+				it.curRid = rid
+				it.curTuple = storage.RawTuple(it.buffer[:rowSize])
+
+				it.frame.PageLatch.RUnlock()
+				return true
+			}
+		}
+
+		it.frame.PageLatch.RUnlock()
+		it.tableHeap.bufferPool.UnpinPage(it.frame, false)
+		it.frame = nil
+		it.pageNum++
+		it.slot = -1
+	}
+
+	return false
 }
 
 // CurrentTuple returns the raw bytes of the tuple at the current cursor position.
 // The bytes are valid only until Next() is called again.
 func (it *TableHeapIterator) CurrentTuple() storage.RawTuple {
-	panic("unimplemented")
+	return it.curTuple
 }
 
 // CurrentRID returns the RecordID of the current tuple.
 func (it *TableHeapIterator) CurrentRID() common.RecordID {
-	panic("unimplemented")
+	return it.curRid
 }
 
 // CurrentRID returns the first error encountered during iteration, if any.
 func (it *TableHeapIterator) Error() error {
-	panic("unimplemented")
+	if it == nil {
+		return nil
+	}
+	return it.err
 }
 
 // Close releases any resources associated with the TableHeapIterator
 func (it *TableHeapIterator) Close() error {
-	panic("unimplemented")
+	if it == nil || it.closed {
+		return nil
+	}
+
+	if it.frame != nil {
+		it.tableHeap.bufferPool.UnpinPage(it.frame, false)
+		it.frame = nil
+	}
+
+	it.curTuple = nil
+	it.closed = true
+	return nil
 }
