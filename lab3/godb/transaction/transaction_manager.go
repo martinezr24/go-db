@@ -14,6 +14,13 @@ import (
 type activeTxnEntry struct {
 	txn      *TransactionContext
 	startLsn storage.LSN
+
+	commitLSN   storage.LSN
+	hasCommit   bool
+	abortLSN    storage.LSN
+	hasAbort    bool
+	undoCursor  int
+	undoStarted bool
 }
 
 // TransactionManager is the central component managing the lifecycle of transactions.
@@ -41,12 +48,52 @@ type TransactionManager struct {
 
 // NewTransactionManager initializes the transaction manager.
 func NewTransactionManager(logManager storage.LogManager, bufferPool *storage.BufferPool, lockManager *LockManager) *TransactionManager {
-	panic("unimplemented")
+	tm := &TransactionManager{
+		activeTxns:  xsync.NewMapOf[common.TransactionID, activeTxnEntry](),
+		logManager:  logManager,
+		bufferPool:  bufferPool,
+		lockManager: lockManager,
+	}
+	tm.txnPool.New = func() any {
+		return &TransactionContext{
+			lm:         lockManager,
+			logRecords: newLogRecordBuffer(),
+			heldLocks:  make(map[DBLockTag]DBLockMode),
+		}
+	}
+	return tm
 }
 
 // Begin starts a new transaction and returns the initialized context.
 func (tm *TransactionManager) Begin() (*TransactionContext, error) {
-	return nil, nil
+	txnID := common.TransactionID(tm.nextTxnID.Add(1))
+	txn := tm.txnPool.Get().(*TransactionContext)
+	txn.lm = tm.lockManager
+	if txn.logRecords == nil {
+		txn.logRecords = newLogRecordBuffer()
+	}
+	if txn.heldLocks == nil {
+		txn.heldLocks = make(map[DBLockTag]DBLockMode)
+	}
+	txn.Reset(txnID)
+
+	record := txn.NewBeginTransactionRecord()
+	startLSN, err := tm.logManager.Append(record)
+	if err != nil {
+		txn.logRecords.pop()
+		txn.Reset(0)
+		tm.txnPool.Put(txn)
+		return nil, err
+	}
+
+	tm.snapshotMu.RLock()
+	tm.activeTxns.Store(txnID, activeTxnEntry{
+		txn:        txn,
+		startLsn:   startLSN,
+		undoCursor: -1,
+	})
+	tm.snapshotMu.RUnlock()
+	return txn, nil
 }
 
 // Commit completes a transaction and makes its effects durable and visible.
@@ -62,25 +109,146 @@ func (tm *TransactionManager) Begin() (*TransactionContext, error) {
 // touches ~139 call sites, including student-facing code, and these tests
 // are already shipped in the autograder.
 func (tm *TransactionManager) Commit(txn *TransactionContext) error {
+	if txn == nil {
+		return fmt.Errorf("cannot commit a nil transaction")
+	}
+	tm.snapshotMu.RLock()
+	defer tm.snapshotMu.RUnlock()
 
-	// Execute In-Memory changes (Indexes) after flushed. Think about how this should interleave with the commit logic.
+	entry, ok := tm.activeTxns.Load(txn.ID())
+	if !ok || entry.txn != txn {
+		return fmt.Errorf("transaction %d is not active", txn.ID())
+	}
+
+	if !entry.hasCommit {
+		record := txn.NewCommitRecord()
+		lsn, err := tm.logManager.Append(record)
+		if err != nil {
+			txn.logRecords.pop()
+			return err
+		}
+		entry.commitLSN = lsn
+		entry.hasCommit = true
+		tm.activeTxns.Store(txn.ID(), entry)
+	}
+	if err := tm.logManager.WaitUntilFlushed(entry.commitLSN); err != nil {
+		return err
+	}
+
+	// Deferred index deletions must run while this transaction still holds its locks.
 	for _, task := range txn.commitActions {
 		task.Target.Invoke(task.Type, task.Key, task.RID)
 	}
+
+	txn.ReleaseAllLocks()
+	tm.activeTxns.Delete(txn.ID())
+	txn.Reset(0)
+	tm.txnPool.Put(txn)
 	return nil
 }
 
 // Abort stops a transaction and ensures its effects are rolled back
 func (tm *TransactionManager) Abort(txn *TransactionContext) error {
-	// Rollback In-Memory changes (Indexes)
-	// YOU SHOULD NOT NEED TO MODIFY THIS LOGIC
-	for i := len(txn.abortActions) - 1; i >= 0; i-- {
-		cleanupTask := txn.abortActions[i]
-		cleanupTask.Target.Invoke(cleanupTask.Type, cleanupTask.Key, cleanupTask.RID)
+	if txn == nil {
+		return fmt.Errorf("cannot abort a nil transaction")
+	}
+	tm.snapshotMu.RLock()
+	defer tm.snapshotMu.RUnlock()
+
+	entry, ok := tm.activeTxns.Load(txn.ID())
+	if !ok || entry.txn != txn {
+		return fmt.Errorf("transaction %d is not active", txn.ID())
+	}
+	if !entry.undoStarted {
+		entry.undoCursor = txn.logRecords.len() - 1
+		entry.undoStarted = true
+		tm.activeTxns.Store(txn.ID(), entry)
 	}
 
-	fmt.Printf("Aborting transaction %d\n", txn.ID())
-	// Add your implementation here
+	for entry.undoCursor >= 0 {
+		record := txn.logRecords.get(entry.undoCursor)
+		switch record.RecordType() {
+		case storage.LogInsert, storage.LogUpdate, storage.LogDelete:
+			if err := tm.undoRecord(txn, record); err != nil {
+				return err
+			}
+		}
+		entry.undoCursor--
+		tm.activeTxns.Store(txn.ID(), entry)
+	}
+
+	if !entry.hasAbort {
+		abortRecord := txn.NewAbortRecord()
+		lsn, err := tm.logManager.Append(abortRecord)
+		if err != nil {
+			txn.logRecords.pop()
+			return err
+		}
+		entry.abortLSN = lsn
+		entry.hasAbort = true
+		tm.activeTxns.Store(txn.ID(), entry)
+	}
+	if err := tm.logManager.WaitUntilFlushed(entry.abortLSN); err != nil {
+		return err
+	}
+
+	// Rollback in-memory index inserts only after the durable abort decision, while
+	// the transaction still owns its locks.
+	for i := len(txn.abortActions) - 1; i >= 0; i-- {
+		task := txn.abortActions[i]
+		task.Target.Invoke(task.Type, task.Key, task.RID)
+	}
+
+	txn.ReleaseAllLocks()
+	tm.activeTxns.Delete(txn.ID())
+	txn.Reset(0)
+	tm.txnPool.Put(txn)
+	return nil
+}
+
+func (tm *TransactionManager) undoRecord(txn *TransactionContext, record storage.LogRecord) error {
+	rid := record.RID()
+	frame, err := tm.bufferPool.GetPage(rid.PageID)
+	if err != nil {
+		return err
+	}
+
+	frame.PageLatch.Lock()
+	var clr storage.LogRecord
+	switch record.RecordType() {
+	case storage.LogInsert:
+		clr = txn.NewInsertCLR(record)
+	case storage.LogUpdate:
+		clr = txn.NewUpdateCLR(record)
+	case storage.LogDelete:
+		clr = txn.NewDeleteCLR(record)
+	default:
+		frame.PageLatch.Unlock()
+		tm.bufferPool.UnpinPage(frame, false)
+		return nil
+	}
+
+	lsn, err := tm.logManager.Append(clr)
+	if err != nil {
+		txn.logRecords.pop()
+		frame.PageLatch.Unlock()
+		tm.bufferPool.UnpinPage(frame, false)
+		return err
+	}
+	frame.MonotonicallyUpdateLSN(lsn)
+
+	hp := frame.AsHeapPage()
+	switch record.RecordType() {
+	case storage.LogInsert:
+		hp.MarkDeleted(rid, true)
+	case storage.LogUpdate:
+		copy(hp.AccessTuple(rid), clr.AfterImage())
+	case storage.LogDelete:
+		hp.MarkDeleted(rid, false)
+	}
+
+	frame.PageLatch.Unlock()
+	tm.bufferPool.UnpinPage(frame, true)
 	return nil
 }
 
