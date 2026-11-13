@@ -7,34 +7,86 @@ import (
 
 // SeqScanExecutor implements a sequential scan over a table.
 type SeqScanExecutor struct {
-	// Fill me in!
+	plan      *planner.SeqScanNode
+	tableHeap *TableHeap
+	buffer    []byte
+	current   storage.Tuple
+	err       error
+	iterator  TableHeapIterator
 }
 
 // NewSeqScanExecutor creates a new SeqScanExecutor.
 func NewSeqScanExecutor(plan *planner.SeqScanNode, tableHeap *TableHeap) *SeqScanExecutor {
-	panic("unimplemented")
+	return &SeqScanExecutor{
+		plan:      plan,
+		tableHeap: tableHeap,
+	}
 }
 
 func (e *SeqScanExecutor) PlanNode() planner.PlanNode {
-	panic("unimplemented")
+	return e.plan
 }
 
 func (e *SeqScanExecutor) Init(context *ExecutorContext) error {
-	panic("unimplemented")
+	if !e.iterator.IsNil() {
+		if err := e.iterator.Close(); err != nil {
+			e.err = err
+			return err
+		}
+		e.iterator = TableHeapIterator{}
+	}
+
+	e.err = nil
+	e.current = storage.Tuple{}
+	e.buffer = make([]byte, e.tableHeap.StorageSchema().BytesPerTuple())
+
+	iterator, err := e.tableHeap.Iterator(
+		context.GetTransaction(),
+		e.plan.Mode,
+		e.buffer,
+	)
+	if err != nil {
+		e.err = err
+		return err
+	}
+
+	e.iterator = iterator
+	return nil
 }
 
 func (e *SeqScanExecutor) Next() bool {
-	panic("unimplemented")
+	if e.err != nil {
+		return false
+	}
+
+	if !e.iterator.Next() {
+		e.err = e.iterator.Error()
+		return false
+	}
+
+	e.current = storage.FromRawTuple(
+		e.iterator.CurrentTuple(),
+		e.tableHeap.StorageSchema(),
+		e.iterator.CurrentRID(),
+	)
+	return true
 }
 
 func (e *SeqScanExecutor) Current() storage.Tuple {
-	panic("unimplemented")
+	return e.current
 }
 
 func (e *SeqScanExecutor) Error() error {
-	panic("unimplemented")
+	return e.err
 }
 
 func (e *SeqScanExecutor) Close() error {
-	panic("unimplemented")
+	if e.iterator.IsNil() {
+		return nil
+	}
+	if err := e.iterator.Close(); err != nil {
+		return err
+	}
+	e.iterator = TableHeapIterator{}
+	return nil
 }
