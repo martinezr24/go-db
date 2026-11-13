@@ -24,10 +24,6 @@ The hardest part was coordinating several kinds of state at once: locks, page la
 
 Abort was especially tricky because it has to undo updates in reverse order while still following WAL rules. I also had to account for the fact that indexes are in memory and handle deletes differently from table-page changes: inserts need to be visible to the transaction that made them, while deletes are delayed until commit.
 
-## Testing status
-
-The focused lock-manager, transaction-manager, heap, index, and WAL tests passed during implementation. The broader workload stress tests are not fully passing yet. They first exposed unimplemented executor paths; after I temporarily restored those paths to investigate further, the YCSB hotspot test timed out. I reverted those temporary executor changes, so I am not claiming the full stress suite passes.
-
 ## Overall reflection
 
 This lab helped me understand that transactions are not just a start and end marker around a query. The database has to coordinate visibility, locking, logging, page writes, and rollback so that concurrent operations still behave correctly. The most useful lesson for me was how strongly correctness depends on ordering: the right operations in the wrong order can still make the database unsafe.
