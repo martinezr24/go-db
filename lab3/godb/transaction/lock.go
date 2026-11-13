@@ -10,6 +10,7 @@ import (
 type lockState struct {
 	holders map[common.TransactionID]DBLockMode
 	waiters []lockRequest
+	changed *sync.Cond
 }
 
 type lockRequest struct {
@@ -86,9 +87,8 @@ func (m DBLockMode) String() string {
 
 // LockManager manages the granting, releasing, and waiting of locks on database resources.
 type LockManager struct {
-	mu      sync.Mutex
-	changed *sync.Cond
-	locks   map[DBLockTag]*lockState
+	mu    sync.Mutex
+	locks map[DBLockTag]*lockState
 }
 
 // NewLockManager initializes a new LockManager.
@@ -96,8 +96,14 @@ func NewLockManager() *LockManager {
 	lm := &LockManager{
 		locks: make(map[DBLockTag]*lockState),
 	}
-	lm.changed = sync.NewCond(&lm.mu)
 	return lm
+}
+
+func (lm *LockManager) newLockState() *lockState {
+	return &lockState{
+		holders: make(map[common.TransactionID]DBLockMode),
+		changed: sync.NewCond(&lm.mu),
+	}
 }
 
 func compatible(a, b DBLockMode) bool {
@@ -143,55 +149,24 @@ func (lm *LockManager) canGrantQueued(state *lockState, index int) bool {
 	return true
 }
 
-func (lm *LockManager) waitsForGraph() map[common.TransactionID]map[common.TransactionID]struct{} {
-	graph := make(map[common.TransactionID]map[common.TransactionID]struct{})
-	addEdge := func(from, to common.TransactionID) {
-		if from == to {
-			return
-		}
-		if graph[from] == nil {
-			graph[from] = make(map[common.TransactionID]struct{})
-		}
-		graph[from][to] = struct{}{}
-	}
-
-	for _, state := range lm.locks {
-		for i, request := range state.waiters {
-			for holderID, heldMode := range state.holders {
-				if holderID != request.tid && !compatible(request.mode, heldMode) {
-					addEdge(request.tid, holderID)
-				}
-			}
-			for j := 0; j < i; j++ {
-				earlier := state.waiters[j]
-				if earlier.tid != request.tid && !compatible(request.mode, earlier.mode) {
-					addEdge(request.tid, earlier.tid)
-				}
-			}
+// mustDie implements wait-die deadlock prevention. Transaction IDs increase
+// over time, so a younger requester may not wait for an older conflicting
+// transaction. Applying the rule to queued conflicts also prevents compatible
+// newcomers from starving an older queued writer.
+func mustDie(state *lockState, index int) bool {
+	request := state.waiters[index]
+	for holderID, heldMode := range state.holders {
+		if holderID != request.tid && !compatible(request.mode, heldMode) && request.tid > holderID {
+			return true
 		}
 	}
-	return graph
-}
-
-func hasWaitCycleFrom(tid common.TransactionID, graph map[common.TransactionID]map[common.TransactionID]struct{}) bool {
-	visited := make(map[common.TransactionID]bool)
-	var reaches func(common.TransactionID) bool
-	reaches = func(current common.TransactionID) bool {
-		for next := range graph[current] {
-			if next == tid {
-				return true
-			}
-			if !visited[next] {
-				visited[next] = true
-				if reaches(next) {
-					return true
-				}
-			}
+	for i := 0; i < index; i++ {
+		earlier := state.waiters[i]
+		if earlier.tid != request.tid && !compatible(request.mode, earlier.mode) && request.tid > earlier.tid {
+			return true
 		}
-		return false
 	}
-	visited[tid] = true
-	return reaches(tid)
+	return false
 }
 
 // Lock acquires a lock on a specific resource (Table or Tuple) with the requested mode. If the lock cannot be acquired
@@ -203,9 +178,7 @@ func (lm *LockManager) Lock(tid common.TransactionID, tag DBLockTag, mode DBLock
 
 	state := lm.locks[tag]
 	if state == nil {
-		state = &lockState{
-			holders: make(map[common.TransactionID]DBLockMode),
-		}
+		state = lm.newLockState()
 		lm.locks[tag] = state
 	}
 
@@ -236,15 +209,15 @@ func (lm *LockManager) Lock(tid common.TransactionID, tag DBLockTag, mode DBLock
 		waiterIndex = len(state.waiters) - 1
 	}
 
-	if hasWaitCycleFrom(tid, lm.waitsForGraph()) {
+	if mustDie(state, waiterIndex) {
 		state.waiters = append(state.waiters[:waiterIndex], state.waiters[waiterIndex+1:]...)
 		if len(state.holders) == 0 && len(state.waiters) == 0 {
 			delete(lm.locks, tag)
 		}
-		lm.changed.Broadcast()
+		state.changed.Broadcast()
 		return common.GoDBError{
 			Code:      common.DeadlockError,
-			ErrString: "lock request would create a wait-for cycle",
+			ErrString: "younger transaction cannot wait for an older transaction",
 		}
 	}
 
@@ -257,22 +230,13 @@ func (lm *LockManager) Lock(tid common.TransactionID, tag DBLockTag, mode DBLock
 			if lm.canGrantQueued(state, i) {
 				state.waiters = append(state.waiters[:i], state.waiters[i+1:]...)
 				state.holders[tid] = mode
-				lm.changed.Broadcast()
+				state.changed.Broadcast()
 				return nil
 			}
 			break
 		}
 
-		lm.changed.Wait()
-
-		state = lm.locks[tag]
-		if state == nil {
-			state = &lockState{
-				holders: make(map[common.TransactionID]DBLockMode),
-			}
-			lm.locks[tag] = state
-			state.waiters = append(state.waiters, lockRequest{tid: tid, tag: tag, mode: mode})
-		}
+		state.changed.Wait()
 	}
 }
 
@@ -303,7 +267,7 @@ func (lm *LockManager) Unlock(tid common.TransactionID, tag DBLockTag) error {
 		delete(lm.locks, tag)
 	}
 
-	lm.changed.Broadcast()
+	state.changed.Broadcast()
 	return nil
 }
 

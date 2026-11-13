@@ -331,42 +331,11 @@ func makeMultiColumnKey(values []common.Value, types []common.Type) (indexing.Ke
 }
 
 func applyIndexResidualsAndProjection(physicalNode PlanNode, scanNode *LogicalScanNode, match *IndexMatchResult, c *catalog.Catalog, exprBinder *ExpressionBinder) (PlanNode, error) {
-	// Conditions that were not used by the Index Scan are implemented by a filter
-	usedSet := make(map[Expr]bool)
-	for _, expr := range match.MatchedPreds {
-		usedSet[expr] = true
-	}
-
-	dnfPredicates := predicatesToDNFTerms(scanNode.Predicates)
-	newDnfPredicates := make([][]Expr, 0, len(dnfPredicates))
-
-	// If one DNF term is fully satisfied by the index (i.e., no residuals),
-	// the entire DNF is satisfied, so no filter is needed.
-	var hasFullyMatchedTerm bool
-	for _, term := range dnfPredicates {
-		var residuals []Expr
-		for _, pred := range term {
-			if !usedSet[pred] {
-				residuals = append(residuals, pred)
-			}
-		}
-		if len(residuals) == 0 {
-			// This term is fully matched by the index, so the entire OR is satisfied
-			hasFullyMatchedTerm = true
-			break
-		}
-		newDnfPredicates = append(newDnfPredicates, residuals)
-	}
-
-	// If one complete DNF term was satisfied by the index, no filter needed at all
-	var residuals []Expr
-	if !hasFullyMatchedTerm {
-		// Merge residual DNF predicates back into a single expression tree for the filter node.
-		// Convert each residual term (conjunction) into an OR of conjunctions.
-		for _, term := range newDnfPredicates {
-			residuals = append(residuals, MergePredicates(term))
-		}
-	}
+	// An index determines the candidate set, but the original predicate must still
+	// be rechecked against the heap tuple. This is required for adjusted exclusive
+	// range bounds, compound/DNF predicates, and stale in-memory index entries.
+	residuals := scanNode.Predicates
+	_ = match
 
 	if scanNode.projection != nil {
 		var plan PlanNode = physicalNode

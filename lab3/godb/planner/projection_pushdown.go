@@ -58,12 +58,6 @@ func (r *ProjectionPushDownRule) PostProcess(node LogicalPlanNode) LogicalPlanNo
 				panic("Error in logical query optimization - ProjectionPushDownRule PostProcess: child projection does not cover required/output schema of parent projection.")
 			}
 		}
-		if childScan, isChildScan := proj.Child.(*LogicalScanNode); isChildScan {
-			// Attach projection node to the scan node for more idiomatic optimizations during the
-			// physicalization step.
-			childScan.AddProjection(proj)
-			return childScan
-		}
 		return node
 	}
 
